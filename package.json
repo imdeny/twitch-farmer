@@ -1,0 +1,14 @@
+{
+  "name": "twitch-point-collector",
+  "version": "1.0.0",
+  "description": "Automated Twitch Channel Points collector",
+  "main": "collector.js",
+  "scripts": {
+    "start": "node collector.js"
+  },
+  "dependencies": {
+    "puppeteer": "^23.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
