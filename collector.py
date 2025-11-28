@@ -106,6 +106,16 @@ class TwitchFarmer:
         except Exception as e:
             logging.error(f"[{name}] Error claiming bonus: {e}")
 
+    async def log_channel_points(self, page: Page, name: str):
+        """Logs the current channel points."""
+        try:
+            balance_selector = '[data-test-selector="balance-string"]'
+            if await page.locator(balance_selector).is_visible():
+                points = await page.locator(balance_selector).inner_text()
+                logging.info(f"[{name}] Current Channel Points: {points}")
+        except Exception:
+            pass
+
     async def check_chat_list(self, page: Page, name: str):
         """Checks if MY_USERNAME is present in the chat list."""
         if not MY_USERNAME:
@@ -243,6 +253,9 @@ class TwitchFarmer:
 
             # Claim Bonus
             await self.claim_bonus(page, name)
+
+            # Log Channel Points
+            await self.log_channel_points(page, name)
 
             # Wait
             await asyncio.sleep(TAB_SWITCH_DELAY)
