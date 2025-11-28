@@ -6,6 +6,7 @@ import time
 from typing import Dict, Optional, List
 
 from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright_stealth import Stealth
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -44,12 +45,31 @@ class TwitchFarmer:
 
     async def launch_browser(self, p) -> BrowserContext:
         logging.info(f"Launching browser with user data dir: {USER_DATA_DIR}")
-        return await p.chromium.launch_persistent_context(
+        # Use a standard user agent to avoid detection/mobile views
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        
+        context = await p.chromium.launch_persistent_context(
             USER_DATA_DIR,
             headless=HEADLESS,
             channel="chrome",
-            args=["--disable-blink-features=AutomationControlled"]
+            user_agent=user_agent,
+            viewport={"width": 1920, "height": 1080},
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080",
+                "--disable-infobars",
+                "--excludeSwitches=enable-automation",
+                "--use-fake-ui-for-media-stream",
+            ]
         )
+        
+        # Apply stealth to all pages created in this context
+        await Stealth().apply_stealth_async(context.pages[0])
+        
+        # Remove navigator.webdriver property
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        return context
 
     async def check_channel_status(self, page: Page, name: str) -> bool:
         """Checks if the channel is offline. Returns True if offline."""
@@ -103,13 +123,27 @@ class TwitchFarmer:
 
         logging.info(f"[{name}] Checking if '{MY_USERNAME}' is in chat list...")
         try:
+            # Check for "Close Threads" button first (if we are in a thread)
+            close_threads_btn = page.locator("button[aria-label='Close Threads']")
+            if await close_threads_btn.is_visible():
+                logging.info(f"[{name}] 'Close Threads' button found. Clicking to return to main chat...")
+                await close_threads_btn.click()
+                await asyncio.sleep(1)
+
             community_btn = page.locator("button[aria-label='Community']")
             if await community_btn.is_visible():
                 await community_btn.click(timeout=3000)
                 
                 try:
-                    await asyncio.sleep(1)
+                    # Increased wait time for the list to load
+                    await asyncio.sleep(3)
+                    
+                    # Explicitly wait for the filter input
                     search_input = page.get_by_placeholder("Filter", exact=False)
+                    try:
+                        await search_input.wait_for(state="visible", timeout=5000)
+                    except:
+                        pass # Handle in the if block below
                     
                     if await search_input.is_visible():
                         logging.info(f"[{name}] Filtering for '{MY_USERNAME}'...")
@@ -118,6 +152,19 @@ class TwitchFarmer:
                         await asyncio.sleep(1)
                     else:
                         logging.warning(f"[{name}] Warning: Could not find 'Filter' input. Checking visible list only.")
+                        if HEADLESS:
+                            try:
+                                timestamp = int(time.time())
+                                debug_file_img = f"debug_headless_{name}_{timestamp}.png"
+                                debug_file_html = f"debug_headless_{name}_{timestamp}.html"
+                                
+                                await page.screenshot(path=debug_file_img)
+                                with open(debug_file_html, "w", encoding="utf-8") as f:
+                                    f.write(await page.content())
+                                    
+                                logging.info(f"[{name}] Saved debug screenshot to {debug_file_img} and HTML to {debug_file_html}")
+                            except Exception as e:
+                                logging.error(f"[{name}] Failed to save debug info: {e}")
 
                     if await page.get_by_text(MY_USERNAME, exact=True).is_visible():
                         logging.info(f"[{name}] STATUS: '{MY_USERNAME}' FOUND in chat list! ✅")
@@ -213,8 +260,9 @@ class TwitchFarmer:
             # Wait
             await asyncio.sleep(TAB_SWITCH_DELAY)
 
-            # Check Chat List
-            await self.check_chat_list(page, name)
+            # Check Chat List (Only if not headless)
+            if not HEADLESS:
+                await self.check_chat_list(page, name)
 
         except Exception as e:
             logging.error(f"[{name}] Error processing: {e}")
