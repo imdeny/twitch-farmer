@@ -1,242 +1,247 @@
 import asyncio
-from playwright.async_api import async_playwright
+import logging
 import os
 import sys
 import time
+from typing import Dict, Optional, List
 
+from playwright.async_api import async_playwright, Page, BrowserContext
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
 # --- CONFIGURATION ---
-# Add the Twitch channels you want to farm points from here
-# Loaded from .env file, comma separated
-channels_env = os.getenv("CHANNELS", "")
-CHANNELS = [c.strip() for c in channels_env.split(",") if c.strip()]
+# Logging Configuration
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - [%(levelname)s] - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
-# Your Twitch Username (set this to check if you are in the chat list)
+# Twitch Channels
+CHANNELS_ENV = os.getenv("CHANNELS", "")
+CHANNELS = [c.strip() for c in CHANNELS_ENV.split(",") if c.strip()]
+
+# Twitch Username
 MY_USERNAME = os.getenv("MY_USERNAME")
 
-# Path to store persistent browser data (cookies, login session)
-USER_DATA_DIR = os.path.join(os.getcwd(), "twitch_user_data")
+# Browser Configuration
+HEADLESS = os.getenv("HEADLESS", "False").lower() == "true"
+USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "twitch_user_data")
 
-# Time (seconds) to stay on each tab before switching
+# Timings
 TAB_SWITCH_DELAY = 30
+OFFLINE_COOLDOWN = 3600  # 1 hour
+RESTART_INTERVAL = 14400 # 4 hours
 
-# Cooldown in seconds for offline channels (1 hour)
-OFFLINE_COOLDOWN = 3600 
+class TwitchFarmer:
+    def __init__(self):
+        self.channel_states: Dict[str, Dict] = {
+            name: {"page": None, "next_check": 0} for name in CHANNELS
+        }
 
-# Restart interval in seconds (4 hours) to refresh channel list
-RESTART_INTERVAL = 14400 
-
-async def run():
-    async with async_playwright() as p:
-        print(f"Launching browser with user data dir: {USER_DATA_DIR}")
-        # Launch persistent context to save login state
-        context = await p.chromium.launch_persistent_context(
+    async def launch_browser(self, p) -> BrowserContext:
+        logging.info(f"Launching browser with user data dir: {USER_DATA_DIR}")
+        return await p.chromium.launch_persistent_context(
             USER_DATA_DIR,
-            headless=False, # Must be false to see the browser
-            channel="chrome", # Use installed Chrome if available, or remove to use bundled Chromium
-            args=["--disable-blink-features=AutomationControlled"] # Try to hide automation
+            headless=HEADLESS,
+            channel="chrome",
+            args=["--disable-blink-features=AutomationControlled"]
         )
 
-        # Track state for each channel
-        # Format: { "channel_name": { "page": Page|None, "next_check": timestamp } }
-        channel_states = {name: {"page": None, "next_check": 0} for name in CHANNELS}
+    async def check_channel_status(self, page: Page, name: str) -> bool:
+        """Checks if the channel is offline. Returns True if offline."""
+        is_offline = False
+        
+        # 1. Check for "Chat" tab (standard offline view)
+        try:
+            chat_tab = page.get_by_role("tab", name="Chat")
+            if await chat_tab.is_visible():
+                is_offline = True
+        except Exception:
+            pass
 
-        print("Monitoring started. Channels will be checked periodically.")
-        print("IMPORTANT: If you are not logged in, please log in manually in the browser window now.")
+        # 2. Check for missing video player
+        if not is_offline:
+            try:
+                if not await page.locator("video").first.is_visible():
+                    is_offline = True
+                    logging.info(f"[{name}] Video player not visible. Assuming OFFLINE.")
+            except Exception:
+                pass
+        
+        return is_offline
 
-        # Monitoring loop
-        start_time = time.time()
-        while True:
-            # Check for restart
-            if time.time() - start_time > RESTART_INTERVAL:
-                print(f"Restart interval of {RESTART_INTERVAL}s reached. Restarting script...")
-                break
+    async def claim_bonus(self, page: Page, name: str):
+        """Checks for and claims the bonus chest."""
+        bonus_selector = "button[aria-label='Claim Bonus']"
+        try:
+            if await page.locator(bonus_selector).count() > 0:
+                if await page.locator(bonus_selector).is_visible():
+                    logging.info(f"[{name}] Bonus detected! Clicking...")
+                    await page.click(bonus_selector)
+                    logging.info(f"[{name}] Clicked bonus chest!")
+        except Exception as e:
+            logging.error(f"[{name}] Error claiming bonus: {e}")
 
-            current_time = time.time()
-            
-            for name, state in channel_states.items():
-                page = state["page"]
-                next_check = state["next_check"]
+    async def check_chat_list(self, page: Page, name: str):
+        """Checks if MY_USERNAME is present in the chat list."""
+        if not MY_USERNAME:
+            return
 
-                # 1. If channel is closed and ready to check, open it
-                if page is None:
-                    if current_time >= next_check:
-                        print(f"[{name}] Checking channel (opening tab)...")
-                        try:
-                            new_page = await context.new_page()
-                            await new_page.goto(f"https://www.twitch.tv/{name}")
-                            state["page"] = new_page
-                            # Give it a moment to load
-                            await asyncio.sleep(5)
-                        except Exception as e:
-                            print(f"[{name}] Error opening tab: {e}")
-                    continue # Skip to next channel, let this one load in next cycle
-
-                # 2. If channel is open, process it
+        logging.info(f"[{name}] Checking if '{MY_USERNAME}' is in chat list...")
+        try:
+            community_btn = page.locator("button[aria-label='Community']")
+            if await community_btn.is_visible():
+                await community_btn.click(timeout=3000)
+                
                 try:
-                    # Bring to front to simulate active watching
-                    try:
-                        await page.bring_to_front()
-                    except:
-                        # Page might have been closed manually
-                        state["page"] = None
-                        continue
-
-                    # Check for Raid / URL change
-                    current_url = page.url.lower()
-                    expected_url = f"https://www.twitch.tv/{name}".lower()
-                    if current_url != expected_url and not current_url.startswith(expected_url + "/") and not current_url.startswith(expected_url + "?"):
-                        print(f"[{name}] URL changed to {page.url} (Raid detected). Closing tab.")
-                        await page.close()
-                        state["page"] = None
-                        state["next_check"] = current_time + OFFLINE_COOLDOWN
-                        continue
-
-                    # Check for Offline Status
-                    is_offline = False
-
-                    # 1. Check for "Chat" tab (standard offline view)
-                    try:
-                        chat_tab = page.get_by_role("tab", name="Chat")
-                        if await chat_tab.is_visible():
-                            is_offline = True
-                    except:
-                        pass
-
-                    # 2. Check for missing video player (User suggestion: volume indicator/player missing)
-                    if not is_offline:
-                        try:
-                            # If the video element is not visible, the stream is likely offline
-                            # This handles cases where the stream ends but the page doesn't fully refresh to offline mode
-                            if not await page.locator("video").first.is_visible():
-                                is_offline = True
-                                print(f"[{name}] Video player not visible. Assuming OFFLINE.")
-                        except:
-                            pass
-
-                    if is_offline:
-                        print(f"[{name}] Stream appears OFFLINE. Closing tab for 1 hour.")
-                        await page.close()
-                        state["page"] = None
-                        state["next_check"] = current_time + OFFLINE_COOLDOWN
-                        continue # Done with this channel for now
-
-                    # If Online (or at least not definitely offline):
+                    await asyncio.sleep(1)
+                    search_input = page.get_by_placeholder("Filter", exact=False)
                     
-                    # Enforce volume settings
+                    if await search_input.is_visible():
+                        logging.info(f"[{name}] Filtering for '{MY_USERNAME}'...")
+                        await search_input.click()
+                        await search_input.fill(MY_USERNAME)
+                        await asyncio.sleep(1)
+                    else:
+                        logging.warning(f"[{name}] Warning: Could not find 'Filter' input. Checking visible list only.")
+
+                    if await page.get_by_text(MY_USERNAME, exact=True).is_visible():
+                        logging.info(f"[{name}] STATUS: '{MY_USERNAME}' FOUND in chat list! ✅")
+                    else:
+                        logging.info(f"[{name}] STATUS: '{MY_USERNAME}' NOT FOUND in chat list. ❌")
+                finally:
+                    # Close the list
                     try:
-                        await page.evaluate("""
-                            const video = document.querySelector('video');
-                            if (video) {
-                                if (video.volume !== 0.01 || video.muted) {
-                                    video.volume = 0.01;
-                                    video.muted = false;
-                                }
-                            }
-                        """)
-                    except:
-                        pass 
+                        back_btn = page.locator("button[aria-label='Go back to Chat']")
+                        if await back_btn.count() == 0:
+                            back_btn = page.locator("button[aria-label='Close']")
+                        
+                        if await back_btn.is_visible():
+                            await back_btn.click(timeout=3000)
+                            logging.info(f"[{name}] Closed community tab.")
+                        elif await community_btn.is_visible():
+                            await community_btn.click(timeout=3000)
+                            logging.info(f"[{name}] Closed community tab (Toggle).")
+                        else:
+                            logging.warning(f"[{name}] Warning: Could not find button to close list.")
+                    except Exception as e:
+                        logging.warning(f"[{name}] Warning: Could not close community tab: {e}")
+            else:
+                logging.warning(f"[{name}] Could not find Community button.")
+        except Exception as e:
+            logging.error(f"[{name}] Error checking chat list: {e}")
 
-                    # Check for Bonus Button
-                    bonus_selector = "button[aria-label='Claim Bonus']"
-                    if await page.locator(bonus_selector).count() > 0:
-                        if await page.locator(bonus_selector).is_visible():
-                            print(f"[{name}] Bonus detected! Clicking...")
-                            await page.click(bonus_selector)
-                            print(f"[{name}] Clicked bonus chest!")
-                    
-                    # Stay on this tab for a few seconds
-                    await asyncio.sleep(TAB_SWITCH_DELAY)
+    async def process_channel(self, context: BrowserContext, name: str, current_time: float):
+        state = self.channel_states[name]
+        page = state["page"]
+        next_check = state["next_check"]
 
-                    # --- Check if we are in the chat list ---
-                    if MY_USERNAME:
-                        print(f"[{name}] Checking if '{MY_USERNAME}' is in chat list...")
-                        try:
-                            # Open Community Tab (Users in Chat)
-                            community_btn = page.locator("button[aria-label='Community']")
-                            if await community_btn.is_visible():
-                                await community_btn.click(timeout=3000)
-                                
-                                try:
-                                    await asyncio.sleep(1) # Wait for list/search bar to appear
-
-                                    # Use the search bar to find the user
-                                    # Twitch usually has a "Filter" input in the community tab
-                                    search_input = page.get_by_placeholder("Filter", exact=False)
-                                    
-                                    if await search_input.is_visible():
-                                        print(f"[{name}] Filtering for '{MY_USERNAME}'...")
-                                        await search_input.click()
-                                        await search_input.fill(MY_USERNAME)
-                                        await asyncio.sleep(1) # Wait for filter results
-                                    else:
-                                        print(f"[{name}] Warning: Could not find 'Filter' input. Checking visible list only.")
-
-                                    # Check for username
-                                    # We look for the exact text of the username now that we've filtered
-                                    if await page.get_by_text(MY_USERNAME, exact=True).is_visible():
-                                        print(f"[{name}] STATUS: '{MY_USERNAME}' FOUND in chat list! ✅")
-                                    else:
-                                        print(f"[{name}] STATUS: '{MY_USERNAME}' NOT FOUND in chat list. ❌")
-                                finally:
-                                    # Close the list (click "Back to Chat" or "Close" button)
-                                    # The user reported we need to click a specific back button, not the community button again.
-                                    try:
-                                        # Try finding the back button.
-                                        # User confirmed the label is "Go back to Chat"
-                                        back_btn = page.locator("button[aria-label='Go back to Chat']")
-                                        
-                                        if await back_btn.count() == 0:
-                                            # Fallback: sometimes it might be "Close" or just a generic back icon
-                                            back_btn = page.locator("button[aria-label='Close']")
-                                        
-                                        if await back_btn.is_visible():
-                                            await back_btn.click(timeout=3000)
-                                            print(f"[{name}] Closed community tab (Go back to Chat).")
-                                        else:
-                                            # If we can't find a back button, maybe the community button IS a toggle?
-                                            # But user said it disappears. Let's try to find the community button again just in case.
-                                            if await community_btn.is_visible():
-                                                await community_btn.click(timeout=3000)
-                                                print(f"[{name}] Closed community tab (Toggle).")
-                                            else:
-                                                print(f"[{name}] Warning: Could not find 'Back to Chat' button to close list.")
-                                                
-                                    except Exception as e:
-                                        print(f"[{name}] Warning: Could not close community tab: {e}")
-
-                            else:
-                                print(f"[{name}] Could not find Community button.")
-                        except Exception as e:
-                            print(f"[{name}] Error checking chat list: {e}")
-                    # ----------------------------------------
-
+        # Open tab if needed
+        if page is None:
+            if current_time >= next_check:
+                logging.info(f"[{name}] Checking channel (opening tab)...")
+                try:
+                    new_page = await context.new_page()
+                    await new_page.goto(f"https://www.twitch.tv/{name}")
+                    state["page"] = new_page
+                    await asyncio.sleep(5) # Wait for load
                 except Exception as e:
-                    print(f"[{name}] Error processing: {e}")
-                    # If critical error, maybe close and retry later
-                    try:
-                        await page.close()
-                    except:
-                        pass
-                    state["page"] = None
+                    logging.error(f"[{name}] Error opening tab: {e}")
+            return
+
+        # Process open tab
+        try:
+            # Bring to front
+            try:
+                await page.bring_to_front()
+            except Exception:
+                state["page"] = None
+                return
+
+            # Check for Raid / URL change
+            current_url = page.url.lower()
+            expected_url = f"https://www.twitch.tv/{name}".lower()
+            if current_url != expected_url and not current_url.startswith(expected_url + "/") and not current_url.startswith(expected_url + "?"):
+                logging.info(f"[{name}] URL changed to {page.url} (Raid detected). Closing tab.")
+                await page.close()
+                state["page"] = None
+                state["next_check"] = current_time + OFFLINE_COOLDOWN
+                return
+
+            # Check Offline
+            if await self.check_channel_status(page, name):
+                logging.info(f"[{name}] Stream appears OFFLINE. Closing tab for 1 hour.")
+                await page.close()
+                state["page"] = None
+                state["next_check"] = current_time + OFFLINE_COOLDOWN
+                return
+
+            # Enforce volume
+            try:
+                await page.evaluate("""
+                    const video = document.querySelector('video');
+                    if (video) {
+                        if (video.volume !== 0.01 || video.muted) {
+                            video.volume = 0.01;
+                            video.muted = false;
+                        }
+                    }
+                """)
+            except Exception:
+                pass
+
+            # Claim Bonus
+            await self.claim_bonus(page, name)
+
+            # Wait
+            await asyncio.sleep(TAB_SWITCH_DELAY)
+
+            # Check Chat List
+            await self.check_chat_list(page, name)
+
+        except Exception as e:
+            logging.error(f"[{name}] Error processing: {e}")
+            try:
+                await page.close()
+            except:
+                pass
+            state["page"] = None
+
+    async def run(self):
+        async with async_playwright() as p:
+            context = await self.launch_browser(p)
             
-            # Wait before next cycle
-            await asyncio.sleep(2)
+            logging.info("Monitoring started. Channels will be checked periodically.")
+            logging.info("IMPORTANT: If you are not logged in, please log in manually in the browser window now.")
+
+            start_time = time.time()
+            while True:
+                if time.time() - start_time > RESTART_INTERVAL:
+                    logging.info(f"Restart interval of {RESTART_INTERVAL}s reached. Restarting script...")
+                    break
+
+                current_time = time.time()
+                for name in CHANNELS:
+                    await self.process_channel(context, name, current_time)
+                
+                await asyncio.sleep(2)
 
 if __name__ == "__main__":
     should_restart = True
     try:
-        asyncio.run(run())
+        farmer = TwitchFarmer()
+        asyncio.run(farmer.run())
     except KeyboardInterrupt:
-        print("Script stopped by user.")
+        logging.info("Script stopped by user.")
         should_restart = False
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        logging.critical(f"Unexpected error: {e}")
         should_restart = False
 
     if should_restart:
-        print("Re-executing script to apply updates...")
+        logging.info("Re-executing script to apply updates...")
         os.execv(sys.executable, [sys.executable] + sys.argv)

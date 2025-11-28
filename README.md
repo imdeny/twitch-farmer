@@ -17,6 +17,8 @@ A Python script to automate watching Twitch streams to farm channel points.
     - Edit `.env` and add your configuration:
         - `MY_USERNAME`: Your Twitch username (used to check if you are in the chat list).
         - `CHANNELS`: A comma-separated list of Twitch channels to monitor.
+        - `HEADLESS`: Set to `True` to run the browser in headless mode (default: `False`).
+        - `LOG_LEVEL`: Set logging level (e.g., `INFO`, `DEBUG`; default: `INFO`).
 
 3.  **Run**:
     ```bash
